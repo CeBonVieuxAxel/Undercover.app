@@ -1,0 +1,1222 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Undercover v0.1 — Messagerie P2P Chiffrée (Windows Desktop)</title>
+
+  <!-- Google Fonts : Kalam (Aspect manuscrit tableau noir) & Inter (Données & Clés) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Kalam:wght@400;700&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS Play CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            chalk: ['Kalam', 'cursive', 'sans-serif'],
+            sans: ['Inter', 'sans-serif'],
+          },
+          colors: {
+            chalkDark: '#121212',
+            chalkCard: '#1E1E1E',
+            chalkBorder: '#2E2E2E',
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Lucide Icons via CDN -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- React 18 & Babel via CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    /* Effets de craie et textures légères */
+    .chalk-bg {
+      background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+      background-size: 20px 20px;
+    }
+    .rose-bg {
+      background-image: radial-gradient(rgba(244, 63, 94, 0.08) 1px, transparent 1px);
+      background-size: 20px 20px;
+    }
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 5px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: rgba(150, 150, 150, 0.2);
+      border-radius: 9999px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+      background: rgba(150, 150, 150, 0.4);
+    }
+    @keyframes scanline {
+      0% { transform: translateY(0); }
+      50% { transform: translateY(180px); }
+      100% { transform: translateY(0); }
+    }
+    .animate-scanline {
+      animation: scanline 2.5s ease-in-out infinite;
+    }
+  </style>
+</head>
+<body class="bg-black text-gray-100 flex items-center justify-center min-h-screen p-0 sm:p-4 select-none font-sans overflow-hidden">
+
+  <div id="root" class="w-full h-full flex items-center justify-center"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // Helper IPC Tauri v2 pour communiquer avec le backend natif Rust Windows
+    const invokeBackend = async (cmd, args = {}) => {
+      try {
+        if (window.__TAURI__?.core?.invoke) {
+          return await window.__TAURI__.core.invoke(cmd, args);
+        } else if (window.__TAURI_INTERNALS__?.invoke) {
+          return await window.__TAURI_INTERNALS__.invoke(cmd, args);
+        }
+      } catch (err) {
+        console.warn(`[Tauri IPC] Commande '${cmd}' :`, err);
+        throw err;
+      }
+      return null;
+    };
+
+    // Composant icône Lucide robuste avec SVG de secours
+    function LucideIcon({ name, className = "w-4 h-4", size = 18 }) {
+      const containerRef = useRef(null);
+
+      useEffect(() => {
+        if (window.lucide && containerRef.current) {
+          containerRef.current.innerHTML = '';
+          const i = document.createElement('i');
+          i.setAttribute('data-lucide', name);
+          containerRef.current.appendChild(i);
+          window.lucide.createIcons({
+            root: containerRef.current,
+            attrs: { width: size, height: size, class: className }
+          });
+        }
+      }, [name, className, size]);
+
+      return <span ref={containerRef} className="inline-flex items-center justify-center pointer-events-none" />;
+    }
+
+    // Données par défaut initiales
+    const INITIAL_USER = {
+      deviceName: "Nœud P2P Undercover (Windows)",
+      ed25519Key: "ed25519:7E89C04B31FA9A2B6789D1C354E20B8A1D7F",
+      fingerprint: "SHA256:4b91:f0a2:77cd:9a12:88ee:bc21",
+    };
+
+    const DEFAULT_CONTACTS = [
+      { id: "c1", name: "Agent Spectre", key: "A9F2...8C1D", fullKey: "ed25519:A9F28491B3C090D41E7A8C1D", status: "P2P direct", online: true, lastMsg: "Coordonnées de session synchronisées.", time: "14:28" },
+      { id: "c2", name: "Cipher Ghost", key: "3F4B...99A1", fullKey: "ed25519:3F4B11209AC87E5244B399A1", status: "Relais chiffré", online: true, lastMsg: "Clé de session éphémère renouvelée.", time: "Hier" },
+      { id: "c3", name: "Echo Raven", key: "E7D0...5B32", fullKey: "ed25519:E7D012B5678A0091CF235B32", status: "P2P direct", online: false, lastMsg: "Prêt pour le prochain handshake.", time: "02/11" },
+    ];
+
+    const DEFAULT_GROUPS = [
+      { id: "g1", name: "Opérations Ghost", members: 8, keyType: "Clé AES-256", lastMsgTime: "14:32", initials: "OG", preview: "L'échange est verrouillé sous AES-256." },
+      { id: "g2", name: "Conseil Secret Alpha", members: 5, keyType: "Clé AES-GCM", lastMsgTime: "Hier", initials: "CA", preview: "Vérification des nœuds relais terminée." },
+      { id: "g3", name: "Core Devs P2P", members: 12, keyType: "Clé AES-256", lastMsgTime: "01/11", initials: "CD", preview: "Patch Ed25519 appliqué sans fuite de métadonnées." },
+    ];
+
+    // APPLICATION PRINCIPALE
+    function App() {
+      const [theme, setTheme] = useState('dark');
+      const [activeTab, setActiveTab] = useState('conversations');
+      const [contacts, setContacts] = useState(DEFAULT_CONTACTS);
+      const [groups, setGroups] = useState(DEFAULT_GROUPS);
+      const [currentUser, setCurrentUser] = useState(INITIAL_USER);
+      const [isNativeTauri, setIsNativeTauri] = useState(false);
+      const [networkStatus, setNetworkStatus] = useState({ isListening: false, localPort: null, localAddr: "127.0.0.1" });
+      const [toast, setToast] = useState(null);
+
+      // États des formulaires & modales
+      const [newKeyInput, setNewKeyInput] = useState("");
+      const [newContactName, setNewContactName] = useState("");
+      const [showQrScanner, setShowQrScanner] = useState(false);
+      const [showNewGroupModal, setShowNewGroupModal] = useState(false);
+      const [newGroupName, setNewGroupName] = useState("");
+      const [enterpriseActive, setEnterpriseActive] = useState(false);
+      const [showEnterpriseModal, setShowEnterpriseModal] = useState(false);
+      const [activeConversation, setActiveConversation] = useState(null);
+      const [chatMessages, setChatMessages] = useState({});
+      const [currentInputMsg, setCurrentInputMsg] = useState("");
+      const [modalInfo, setModalInfo] = useState(null); // 'cgv', 'faq', null
+
+      // Règle d'or absolue : Logique conditionnelle stricte de navigation
+      const hasContacts = contacts.length > 0;
+
+      useEffect(() => {
+        if (!hasContacts && (activeTab === 'conversations' || activeTab === 'groups')) {
+          setActiveTab('connections');
+          showToastAlert("Aucun contact. Onglets verrouillés sur Connexions & Paramètres.", "info");
+        }
+      }, [hasContacts, activeTab]);
+
+      const showToastAlert = (message, type = "success") => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 3400);
+      };
+
+      const copyToClipboard = (text, label = "Élément") => {
+        navigator.clipboard.writeText(text);
+        showToastAlert(`${label} copié dans le presse-papier !`);
+      };
+
+      // Initialisation native Rust sous Windows (Tauri v2)
+      useEffect(() => {
+        // 1. Identité locale depuis Windows Credential Manager (DPAPI)
+        invokeBackend('get_or_create_identity')
+          .then((ident) => {
+            if (ident) {
+              setIsNativeTauri(true);
+              setCurrentUser({
+                deviceName: ident.device_name || "Nœud P2P Undercover (Windows)",
+                ed25519Key: `ed25519:${ident.ed25519_pubkey_hex}`,
+                fingerprint: ident.fingerprint,
+              });
+              showToastAlert("Identité chargée depuis le coffre Windows DPAPI !", "success");
+            }
+          })
+          .catch(() => {});
+
+        // 2. Démarrage de l'écouteur P2P local (Tokio)
+        invokeBackend('start_p2p_listener')
+          .then((port) => {
+            if (port) {
+              setNetworkStatus({ isListening: true, localPort: port, localAddr: `127.0.0.1:${port}` });
+              console.log(`[Undercover v0.1 P2P] Écouteur actif sur 127.0.0.1:${port}`);
+            }
+          })
+          .catch(() => {});
+
+        // 3. Contacts enregistrés localement
+        invokeBackend('get_contacts')
+          .then((stored) => {
+            if (stored && Array.isArray(stored) && stored.length > 0) {
+              setContacts(stored.map(c => ({
+                id: c.id,
+                name: c.name,
+                key: c.key,
+                fullKey: c.full_key,
+                status: c.status,
+                online: c.online,
+                lastMsg: c.last_msg,
+                time: c.time
+              })));
+            }
+          })
+          .catch(() => {});
+
+        // 4. Écoute temps réel des paquets P2P déchiffrés
+        let unlisten = null;
+        if (window.__TAURI__?.event?.listen) {
+          window.__TAURI__.event.listen('p2p-message-received', (evt) => {
+            const incoming = evt.payload;
+            if (!incoming) return;
+
+            setChatMessages(prev => {
+              const cid = activeConversation ? activeConversation.id : "c1";
+              return {
+                ...prev,
+                [cid]: [
+                  ...(prev[cid] || []),
+                  {
+                    id: incoming.id,
+                    sender: "them",
+                    text: incoming.text,
+                    time: incoming.time,
+                    encrypted: true,
+                    verified: incoming.verified
+                  }
+                ]
+              };
+            });
+            showToastAlert("Message chiffré reçu et vérifié par Ed25519 !", "success");
+          }).then(fn => { unlisten = fn; });
+        }
+
+        return () => {
+          if (unlisten) unlisten();
+        };
+      }, [activeConversation]);
+
+      // Thème dynamique
+      const isDark = theme === 'dark';
+
+      const themeClasses = useMemo(() => {
+        if (isDark) {
+          return {
+            appWrapper: "bg-chalkDark text-gray-100 chalk-bg",
+            card: "bg-gray-800/90 border border-gray-700/80 shadow-lg",
+            cardHover: "hover:border-gray-600 transition-all",
+            subCard: "bg-gray-900/70 border border-gray-800",
+            titleText: "font-chalk text-gray-100",
+            subText: "text-gray-400 font-sans",
+            keyText: "text-blue-400 font-mono",
+            accentBadge: "bg-blue-950/80 text-blue-300 border border-blue-800/60",
+            accentButton: "bg-blue-600 hover:bg-blue-500 text-white font-medium shadow-md shadow-blue-900/30",
+            tabBar: "bg-gray-900/95 border-t border-gray-800 text-gray-400 backdrop-blur-md",
+            tabActive: "text-blue-400 font-bold",
+            input: "bg-gray-900/90 border-gray-700 text-gray-100 placeholder-gray-500 focus:border-blue-500 focus:ring-1 focus:ring-blue-500",
+            header: "bg-gray-900/80 border-b border-gray-800/90 backdrop-blur-md",
+            perkCard: "bg-gradient-to-br from-gray-800 to-gray-900 border border-blue-500/30",
+          };
+        } else {
+          return {
+            appWrapper: "bg-rose-50 text-rose-950 rose-bg",
+            card: "bg-white border border-rose-200/90 shadow-sm",
+            cardHover: "hover:border-rose-300 transition-all shadow-md",
+            subCard: "bg-rose-100/60 border border-rose-200/60",
+            titleText: "font-chalk text-rose-950",
+            subText: "text-rose-700/80 font-sans",
+            keyText: "text-rose-600 font-mono font-medium",
+            accentBadge: "bg-rose-100 text-rose-700 border border-rose-200",
+            accentButton: "bg-rose-600 hover:bg-rose-500 text-white font-medium shadow-md shadow-rose-300",
+            tabBar: "bg-white/95 border-t border-rose-200 text-rose-600/70 backdrop-blur-md",
+            tabActive: "text-rose-600 font-bold",
+            input: "bg-white border-rose-200 text-rose-950 placeholder-rose-400 focus:border-rose-500 focus:ring-1 focus:ring-rose-500",
+            header: "bg-white/80 border-b border-rose-200/90 backdrop-blur-md",
+            perkCard: "bg-gradient-to-br from-white to-rose-100/80 border border-rose-300",
+          };
+        }
+      }, [isDark]);
+
+      // Actions sur les contacts
+      const handleAddContact = async (e) => {
+        if (e) e.preventDefault();
+        const key = newKeyInput.trim();
+        if (!key) {
+          showToastAlert("Veuillez saisir une clé Ed25519 valide.", "error");
+          return;
+        }
+
+        // Tenter l'ajout natif via Tauri IPC Rust
+        try {
+          const rustContact = await invokeBackend('add_contact', {
+            pubkey: key,
+            alias: newContactName.trim() || null
+          });
+          if (rustContact) {
+            const formatted = {
+              id: rustContact.id,
+              name: rustContact.name,
+              key: rustContact.key,
+              fullKey: rustContact.full_key,
+              status: rustContact.status,
+              online: rustContact.online,
+              lastMsg: rustContact.last_msg,
+              time: rustContact.time
+            };
+            setContacts([formatted, ...contacts]);
+            setNewKeyInput("");
+            setNewContactName("");
+            showToastAlert(`Contact validé par le backend Rust !`);
+            return;
+          }
+        } catch (err) {
+          console.warn("Échec add_contact natif:", err);
+          showToastAlert(`Erreur Rust : ${err}`, "error");
+          return;
+        }
+
+        // Fallback UI si hors Tauri
+        const truncated = key.length > 10 ? `${key.substring(0, 4)}...${key.substring(key.length - 4)}` : key;
+        const name = newContactName.trim() || `Nœud ${truncated}`;
+
+        const newContact = {
+          id: "c_" + Date.now(),
+          name: name,
+          key: truncated,
+          fullKey: key,
+          status: "P2P direct",
+          online: true,
+          lastMsg: "Canal chiffré établi.",
+          time: "À l'instant"
+        };
+
+        setContacts([newContact, ...contacts]);
+        setNewKeyInput("");
+        setNewContactName("");
+        showToastAlert(`Connexion établie avec ${name} !`);
+      };
+
+      const handleAddRandomTestContact = () => {
+        const testKeys = [
+          "ed25519:B7E20914F84CD9127819AA1209CE51DF",
+          "ed25519:8812FA00BC34E891276EBA821945C029",
+          "ed25519:4D19E2B771A9008234DF661C9901BA88"
+        ];
+        const randomKey = testKeys[Math.floor(Math.random() * testKeys.length)];
+        const truncated = `${randomKey.substring(8, 12)}...${randomKey.substring(randomKey.length - 4)}`;
+        const names = ["Shadow Operative", "Nœud Scribe", "Relais Berlin", "Sentinelle 09"];
+        const randomName = names[Math.floor(Math.random() * names.length)] + " #" + Math.floor(10 + Math.random() * 89);
+
+        const newContact = {
+          id: "c_" + Date.now(),
+          name: randomName,
+          key: truncated,
+          fullKey: randomKey,
+          status: "P2P direct",
+          online: true,
+          lastMsg: "Handshake cryptographique terminé.",
+          time: "À l'instant"
+        };
+
+        setContacts([newContact, ...contacts]);
+        showToastAlert(`Contact simulé [${randomName}] ajouté !`);
+      };
+
+      const handleDeleteContact = (id, name) => {
+        const remaining = contacts.filter(c => c.id !== id);
+        setContacts(remaining);
+        showToastAlert(`Contact ${name} supprimé.`);
+      };
+
+      const handleSimulateScan = () => {
+        setShowQrScanner(false);
+        const scannedKey = "ed25519:9C12EFA38841B923450912DC771AB3E9";
+        setNewKeyInput(scannedKey);
+        setNewContactName("Nœud Scanné #" + Math.floor(100 + Math.random() * 900));
+        showToastAlert("QR Code décodé avec succès !");
+      };
+
+      const handleCreateGroup = (e) => {
+        e.preventDefault();
+        if (!newGroupName.trim()) return;
+        const group = {
+          id: "g_" + Date.now(),
+          name: newGroupName.trim(),
+          members: 2,
+          keyType: "Clé AES-256",
+          lastMsgTime: "À l'instant",
+          initials: newGroupName.trim().substring(0, 2).toUpperCase(),
+          preview: "Groupe créé et clé AES-256 partagée."
+        };
+        setGroups([group, ...groups]);
+        setNewGroupName("");
+        setShowNewGroupModal(false);
+        showToastAlert(`Groupe "${group.name}" créé.`);
+      };
+
+      const handleSendMessage = async (contactId) => {
+        const textToSend = currentInputMsg.trim();
+        if (!textToSend) return;
+
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const msgObj = {
+          id: "m_" + Date.now(),
+          sender: "me",
+          text: textToSend,
+          time: timeStr,
+          encrypted: true
+        };
+
+        setChatMessages(prev => ({
+          ...prev,
+          [contactId]: [...(prev[contactId] || []), msgObj]
+        }));
+        setCurrentInputMsg("");
+
+        // Chiffrement natif AES-256-GCM via Tauri Rust
+        try {
+          const contact = contacts.find(c => c.id === contactId);
+          if (contact) {
+            const cipher = await invokeBackend('encrypt_message', {
+              peerPubkey: contact.fullKey,
+              text: textToSend
+            });
+            if (cipher) {
+              console.log("[Undercover E2EE] Message chiffré AES-256-GCM :", cipher.substring(0, 28) + "...");
+            }
+          }
+        } catch (err) {
+          console.warn("Chiffrement IPC message :", err);
+        }
+      };
+
+      const getContactMessages = (contact) => {
+        if (chatMessages[contact.id]) return chatMessages[contact.id];
+        return [
+          { id: "m_init_1", sender: "them", text: contact.lastMsg || "Session P2P ouverte. Chiffrement de bout en bout actif.", time: contact.time, encrypted: true },
+        ];
+      };
+
+      return (
+        <div className={`w-full max-w-md h-screen md:h-[94vh] md:max-h-[880px] flex flex-col md:rounded-3xl md:border shadow-2xl relative overflow-hidden transition-colors duration-300 ${themeClasses.appWrapper} ${isDark ? 'md:border-gray-800' : 'md:border-rose-200'}`}>
+          
+          {/* TOAST FLOTTANT */}
+          {toast && (
+            <div className="absolute top-4 left-4 right-4 z-50 flex items-center justify-between px-4 py-3 rounded-xl bg-gray-900/95 text-white border border-gray-700 shadow-2xl backdrop-blur-md text-xs sm:text-sm animate-bounce">
+              <div className="flex items-center space-x-2">
+                <LucideIcon name="shield-check" className="w-4 h-4 text-emerald-400" size={18} />
+                <span className="font-sans font-medium">{toast.message}</span>
+              </div>
+              <button onClick={() => setToast(null)} className="text-gray-400 hover:text-white">✕</button>
+            </div>
+          )}
+
+          {/* BARRE DE TITRE DESKTOP WINDOWS */}
+          <div className={`px-4 py-2 flex items-center justify-between border-b text-xs ${isDark ? 'bg-black/60 border-gray-800/80 text-gray-400' : 'bg-rose-100/60 border-rose-200 text-rose-700'}`}>
+            <div className="flex items-center space-x-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse"></span>
+              <span className="font-mono font-medium tracking-tight">Undercover v0.1 • Windows</span>
+            </div>
+            <div className="flex items-center space-x-2 font-mono text-[11px]">
+              <span className="flex items-center space-x-1">
+                <span className={`w-1.5 h-1.5 rounded-full ${networkStatus.isListening ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
+                <span>{networkStatus.isListening ? networkStatus.localAddr : 'E2EE Natif'}</span>
+              </span>
+            </div>
+          </div>
+
+          {/* CONTENU PRINCIPAL */}
+          <div className="flex-1 overflow-y-auto custom-scrollbar relative flex flex-col">
+            
+            {/* VUE 1 : CONVERSATIONS */}
+            {activeTab === 'conversations' && hasContacts && (
+              <div className="flex-1 flex flex-col p-4 space-y-4">
+                
+                {/* En-tête conversations */}
+                <div className="flex items-center justify-between pb-1">
+                  <div>
+                    <h1 className={`text-2xl font-bold tracking-wide ${themeClasses.titleText}`}>
+                      Discussions P2P
+                    </h1>
+                    <p className={`text-xs ${themeClasses.subText}`}>
+                      Chiffrement direct X25519 + AES-GCM
+                    </p>
+                  </div>
+                  <div className="flex items-center space-x-1.5">
+                    <span className={`text-[11px] px-2.5 py-1 rounded-full font-mono ${themeClasses.accentBadge}`}>
+                      {contacts.length} {contacts.length > 1 ? 'pairs' : 'pair'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Liste des conversations */}
+                <div className="space-y-2.5 flex-1">
+                  {contacts.map((contact) => (
+                    <div 
+                      key={contact.id}
+                      onClick={() => setActiveConversation(contact)}
+                      className={`p-3.5 rounded-2xl cursor-pointer transition-all flex items-center justify-between group ${themeClasses.card} ${themeClasses.cardHover}`}
+                    >
+                      <div className="flex items-center space-x-3.5 min-w-0">
+                        {/* Avatar avec indicateur d'état */}
+                        <div className="relative shrink-0">
+                          <div className={`w-11 h-11 rounded-2xl flex items-center justify-center font-bold text-sm font-sans shadow-inner ${isDark ? 'bg-gradient-to-br from-gray-700 to-gray-900 text-gray-200 border border-gray-700' : 'bg-rose-200 text-rose-800 border border-rose-300'}`}>
+                            {contact.name.substring(0, 2).toUpperCase()}
+                          </div>
+                          <span className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 ${isDark ? 'border-gray-800' : 'border-white'} ${contact.online ? 'bg-emerald-500' : 'bg-gray-500'}`}></span>
+                        </div>
+
+                        {/* Textes contact */}
+                        <div className="min-w-0 space-y-0.5">
+                          <div className="flex items-center space-x-2">
+                            <span className="font-semibold text-sm font-sans truncate">{contact.name}</span>
+                            <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded border ${isDark ? 'bg-black/40 border-gray-700 text-blue-400' : 'bg-rose-100 border-rose-200 text-rose-700'}`}>
+                              {contact.key}
+                            </span>
+                          </div>
+                          <p className={`text-xs truncate ${themeClasses.subText}`}>
+                            {chatMessages[contact.id] && chatMessages[contact.id].length > 0 
+                              ? chatMessages[contact.id][chatMessages[contact.id].length - 1].text 
+                              : contact.lastMsg}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Statut & Heure */}
+                      <div className="text-right shrink-0 space-y-1">
+                        <span className={`text-[10px] ${themeClasses.subText}`}>{contact.time}</span>
+                        <div className="flex items-center justify-end space-x-1">
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-mono ${contact.status === 'P2P direct' ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800/50' : 'bg-blue-950/80 text-blue-400 border border-blue-800/50'}`}>
+                            {contact.status}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* VUE 2 : GROUPES */}
+            {activeTab === 'groups' && hasContacts && (
+              <div className="flex-1 flex flex-col p-4 space-y-4">
+                
+                {/* En-tête : Clé publique de l'utilisateur actuel */}
+                <div className={`p-4 rounded-2xl space-y-2 border ${themeClasses.card}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                      Votre Identité Publique Locale
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 font-mono">
+                      Ed25519
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between bg-black/30 p-2.5 rounded-xl border border-white/5">
+                    <span className={`font-mono text-xs truncate max-w-[260px] ${themeClasses.keyText}`}>
+                      {currentUser.ed25519Key}
+                    </span>
+                    <button 
+                      onClick={() => copyToClipboard(currentUser.ed25519Key, "Votre clé Ed25519")}
+                      className="p-1.5 rounded-lg hover:bg-white/10 transition-colors text-gray-400 hover:text-white"
+                      title="Copier la clé"
+                    >
+                      <LucideIcon name="copy" size={15} />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Titre & Bouton Nouveau Groupe */}
+                <div className="flex items-center justify-between pt-1">
+                  <div>
+                    <h2 className={`text-2xl font-bold ${themeClasses.titleText}`}>
+                      Groupes Sécurisés
+                    </h2>
+                    <p className={`text-xs ${themeClasses.subText}`}>
+                      Canaux multi-pairs à chiffrement symétrique AES-256
+                    </p>
+                  </div>
+                  <button 
+                    onClick={() => setShowNewGroupModal(true)}
+                    className={`p-2.5 rounded-xl flex items-center space-x-1.5 text-xs transition-all ${themeClasses.accentButton}`}
+                  >
+                    <LucideIcon name="plus" size={16} />
+                    <span className="hidden sm:inline">Créer</span>
+                  </button>
+                </div>
+
+                {/* Liste des cartes de groupes */}
+                <div className="space-y-3">
+                  {groups.map((grp) => (
+                    <div 
+                      key={grp.id}
+                      className={`p-4 rounded-2xl flex items-center justify-between border transition-all ${themeClasses.card} ${themeClasses.cardHover}`}
+                    >
+                      <div className="flex items-center space-x-3.5 min-w-0">
+                        <div className={`w-12 h-12 rounded-2xl flex items-center justify-center font-bold text-base font-sans shrink-0 shadow-inner ${isDark ? 'bg-gradient-to-tr from-blue-900 to-indigo-900 text-blue-200 border border-blue-700/50' : 'bg-rose-200 text-rose-900 border border-rose-300'}`}>
+                          {grp.initials}
+                        </div>
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center space-x-2">
+                            <span className="font-semibold text-sm truncate">{grp.name}</span>
+                            <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono ${themeClasses.accentBadge}`}>
+                              {grp.members} membres
+                            </span>
+                          </div>
+                          <p className={`text-xs truncate ${themeClasses.subText}`}>
+                            {grp.preview}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="text-right shrink-0 space-y-1 pl-2">
+                        <span className={`text-[10px] ${themeClasses.subText}`}>{grp.lastMsgTime}</span>
+                        <div>
+                          <span className={`text-[9px] px-2 py-0.5 rounded-full font-mono border ${isDark ? 'bg-blue-950/80 border-blue-800/60 text-blue-300' : 'bg-rose-100 border-rose-200 text-rose-700'}`}>
+                            {grp.keyType}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* VUE 3 : CONNEXIONS (AJOUT ET GESTION CONTACTS) */}
+            {activeTab === 'connections' && (
+              <div className="flex-1 flex flex-col p-4 space-y-4">
+                
+                {/* En-tête */}
+                <div>
+                  <h2 className={`text-2xl font-bold ${themeClasses.titleText}`}>
+                    Connexions & Clés
+                  </h2>
+                  <p className={`text-xs ${themeClasses.subText}`}>
+                    Établissez un canal P2P direct en ajoutant la clé publique d'un correspondant
+                  </p>
+                </div>
+
+                {/* Formulaire d'ajout de clé */}
+                <form onSubmit={handleAddContact} className={`p-4 rounded-2xl space-y-3.5 border ${themeClasses.card}`}>
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold uppercase tracking-wider text-gray-400 flex items-center justify-between">
+                      <span>Clé Publique Ed25519 (32 octets)</span>
+                      <span className="text-[10px] text-blue-400 lowercase font-mono">requis</span>
+                    </label>
+                    <input 
+                      type="text"
+                      value={newKeyInput}
+                      onChange={(e) => setNewKeyInput(e.target.value)}
+                      placeholder="ed25519:A9F28491... ou hexadécimal"
+                      className={`w-full px-3.5 py-2.5 rounded-xl text-xs font-mono border outline-none transition-all ${themeClasses.input}`}
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                      Pseudo / Alias local (Optionnel)
+                    </label>
+                    <input 
+                      type="text"
+                      value={newContactName}
+                      onChange={(e) => setNewContactName(e.target.value)}
+                      placeholder="Ex: Ghost Operative #01"
+                      className={`w-full px-3.5 py-2.5 rounded-xl text-xs border outline-none transition-all ${themeClasses.input}`}
+                    />
+                  </div>
+
+                  <div className="flex items-center space-x-2 pt-1">
+                    <button 
+                      type="submit"
+                      className={`flex-1 py-2.5 px-4 rounded-xl text-xs flex items-center justify-center space-x-2 transition-all ${themeClasses.accentButton}`}
+                    >
+                      <LucideIcon name="user-plus" size={15} />
+                      <span>Ajouter la Connexion</span>
+                    </button>
+
+                    <button 
+                      type="button"
+                      onClick={() => setShowQrScanner(true)}
+                      className={`p-2.5 rounded-xl text-xs border transition-all flex items-center justify-center ${isDark ? 'bg-gray-800 border-gray-700 hover:bg-gray-700' : 'bg-rose-100 border-rose-300 hover:bg-rose-200'}`}
+                      title="Scanner un QR Code"
+                    >
+                      <LucideIcon name="qr-code" size={18} />
+                    </button>
+                  </div>
+                </form>
+
+                {/* Bouton pour tester l'ajout d'un contact */}
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-xs text-gray-400">Besoin d'un contact de test rapide ?</span>
+                  <button 
+                    onClick={handleAddRandomTestContact}
+                    className="text-xs text-blue-400 hover:underline flex items-center space-x-1"
+                  >
+                    <LucideIcon name="sparkles" size={13} />
+                    <span>Générer un nœud test</span>
+                  </button>
+                </div>
+
+                {/* Liste des contacts actuels */}
+                <div className="space-y-2 pt-1">
+                  <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-gray-400 px-1">
+                    <span>Connexions Établies ({contacts.length})</span>
+                    {!hasContacts && (
+                      <span className="text-amber-400 text-[10px] lowercase font-mono">0 contact = navigation verrouillée</span>
+                    )}
+                  </div>
+
+                  {contacts.length === 0 ? (
+                    <div className={`p-6 rounded-2xl text-center space-y-2 border border-dashed ${isDark ? 'border-gray-800 bg-gray-900/30' : 'border-rose-200 bg-rose-50/50'}`}>
+                      <LucideIcon name="shield-alert" className="w-8 h-8 mx-auto text-amber-400/80" size={32} />
+                      <p className="font-chalk text-base">Aucune connexion enregistrée</p>
+                      <p className={`text-xs max-w-xs mx-auto ${themeClasses.subText}`}>
+                        Ajoutez au moins 1 contact pour déverrouiller l'accès aux onglets Conversations et Groupes chiffrés.
+                      </p>
+                    </div>
+                  ) : (
+                    contacts.map((c) => (
+                      <div 
+                        key={c.id}
+                        className={`p-3 rounded-xl flex items-center justify-between border ${themeClasses.card}`}
+                      >
+                        <div className="min-w-0 space-y-0.5">
+                          <div className="flex items-center space-x-2">
+                            <span className="font-semibold text-xs truncate">{c.name}</span>
+                            <span className={`text-[10px] font-mono px-1.5 rounded ${themeClasses.accentBadge}`}>{c.key}</span>
+                          </div>
+                          <p className={`text-[11px] font-mono truncate max-w-[210px] ${themeClasses.subText}`}>
+                            {c.fullKey}
+                          </p>
+                        </div>
+                        <div className="flex items-center space-x-1">
+                          <button 
+                            onClick={() => copyToClipboard(c.fullKey, "Clé de " + c.name)}
+                            className="p-1.5 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+                            title="Copier la clé"
+                          >
+                            <LucideIcon name="copy" size={14} />
+                          </button>
+                          <button 
+                            onClick={() => handleDeleteContact(c.id, c.name)}
+                            className="p-1.5 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
+                            title="Supprimer la connexion"
+                          >
+                            <LucideIcon name="trash-2" size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* VUE 4 : PARAMÈTRES */}
+            {activeTab === 'settings' && (
+              <div className="flex-1 flex flex-col p-4 space-y-4">
+                
+                <div>
+                  <h2 className={`text-2xl font-bold ${themeClasses.titleText}`}>
+                    Paramètres & Identité
+                  </h2>
+                  <p className={`text-xs ${themeClasses.subText}`}>
+                    Configuration de votre nœud et sécurité de l'appareil
+                  </p>
+                </div>
+
+                {/* Carte Identité de l'appareil */}
+                <div className={`p-4 rounded-2xl space-y-3.5 border ${themeClasses.card}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                      Identité de l'Appareil
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-mono">
+                      Windows DPAPI Actif
+                    </span>
+                  </div>
+
+                  <div className="flex items-center space-x-3.5">
+                    {/* QR Code vectoriel */}
+                    <div className="w-16 h-16 bg-white p-1 rounded-xl shadow shrink-0 flex items-center justify-center">
+                      <svg viewBox="0 0 44 44" className="w-full h-full text-black fill-current">
+                        <path d="M0 0h16v16H0V0zm4 4h8v8H4V4zm24-4h16v16H28V0zm4 4h8v8h-8V4zM0 28h16v16H0V28zm4 4h8v8H4v-8zm24 2h4v4h-4v-4zm6 0h4v4h-4v-4zm-6 6h4v4h-4v-4zm6 0h4v4h-4v-4zm-14-14h4v4h-4v-4zm0 6h4v4h-4v-4zm0 6h4v4h-4v-4zm6-12h4v4h-4v-4zm6 0h4v4h-4v-4z"/>
+                      </svg>
+                    </div>
+
+                    <div className="min-w-0 space-y-1 flex-1">
+                      <p className="font-bold text-sm font-sans">{currentUser.deviceName}</p>
+                      <p className={`text-[11px] font-mono truncate ${themeClasses.keyText}`}>
+                        {currentUser.ed25519Key}
+                      </p>
+                      <p className={`text-[10px] font-mono opacity-60 truncate ${themeClasses.subText}`}>
+                        {currentUser.fingerprint}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 flex items-center gap-2">
+                    <button 
+                      onClick={() => copyToClipboard(currentUser.ed25519Key, "Votre clé Ed25519")}
+                      className={`flex-1 py-2 px-3 rounded-xl text-xs flex items-center justify-center space-x-1.5 border transition-all ${isDark ? 'bg-gray-800 border-gray-700 hover:bg-gray-700' : 'bg-rose-100 border-rose-300 hover:bg-rose-200'}`}
+                    >
+                      <LucideIcon name="copy" size={13} />
+                      <span>Copier ma clé Ed25519</span>
+                    </button>
+                    <button 
+                      onClick={() => setShowQrScanner(true)}
+                      className={`p-2 rounded-xl text-xs border transition-all ${isDark ? 'bg-gray-800 border-gray-700 hover:bg-gray-700' : 'bg-rose-100 border-rose-300 hover:bg-rose-200'}`}
+                      title="Afficher mon QR Code"
+                    >
+                      <LucideIcon name="qr-code" size={15} />
+                    </button>
+                  </div>
+
+                  {/* Statut Réseau P2P Temps Réel */}
+                  <div className="pt-2.5 mt-2 border-t border-white/5 flex items-center justify-between text-[11px] font-mono">
+                    <div className="flex items-center space-x-1.5">
+                      <span className={`w-2 h-2 rounded-full ${networkStatus.isListening ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+                      <span className={themeClasses.subText}>
+                        {networkStatus.isListening ? 'Nœud P2P local actif' : 'Transport réseau initialisé'}
+                      </span>
+                    </div>
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full ${isDark ? 'bg-blue-950 text-blue-400 border border-blue-800/40' : 'bg-rose-100 text-rose-700'}`}>
+                      {networkStatus.localAddr}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Commutateur de Thème */}
+                <div className={`p-4 rounded-2xl flex items-center justify-between ${themeClasses.card}`}>
+                  <div className="space-y-0.5">
+                    <span className="font-bold text-sm font-sans">Apparence & Thème</span>
+                    <p className={`text-xs ${themeClasses.subText}`}>
+                      {isDark ? 'Tableau noir / Craie (Dark UI)' : 'Rose et Blanc (Alternative douce)'}
+                    </p>
+                  </div>
+                  
+                  <div className="flex items-center space-x-1 p-1 rounded-xl bg-black/20 border border-white/5">
+                    <button 
+                      onClick={() => setTheme('dark')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center space-x-1 ${isDark ? 'bg-gray-700 text-white shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
+                    >
+                      <span>Tableau</span>
+                    </button>
+                    <button 
+                      onClick={() => setTheme('rose')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center space-x-1 ${!isDark ? 'bg-rose-500 text-white shadow-sm' : 'text-gray-400 hover:text-gray-200'}`}
+                    >
+                      <span>Rose</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Section Perks Entreprise (2,99€/mois) */}
+                <div className={`p-4 rounded-2xl space-y-3 relative overflow-hidden ${themeClasses.perkCard}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold font-mono uppercase tracking-wider text-blue-400 flex items-center space-x-1.5">
+                      <LucideIcon name="crown" size={14} className="text-amber-400" />
+                      <span>Perks Entreprise</span>
+                    </span>
+                    <span className="text-xs font-bold font-mono px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-400/30">
+                      2,99 € / mois
+                    </span>
+                  </div>
+
+                  <p className={`text-xs ${themeClasses.subText}`}>
+                    Débloquez la synchronisation professionnelle et l'intégration collaborative haute sécurité.
+                  </p>
+
+                  <div className="space-y-1.5 text-xs">
+                    <div className="flex items-center space-x-2">
+                      <LucideIcon name="check" size={13} className="text-emerald-400 shrink-0" />
+                      <span>Sync chiffrée Trello & Excel</span>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <LucideIcon name="check" size={13} className="text-emerald-400 shrink-0" />
+                      <span>Support cryptographique dédié 24/7 SLA</span>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <LucideIcon name="check" size={13} className="text-emerald-400 shrink-0" />
+                      <span>Modération d'équipe avancée & audit logs</span>
+                    </div>
+                  </div>
+
+                  <button 
+                    onClick={() => setShowEnterpriseModal(true)}
+                    className="w-full py-2.5 rounded-xl text-xs font-semibold bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-md transition-all flex items-center justify-center space-x-1.5"
+                  >
+                    <span>{enterpriseActive ? 'Abonnement Actif ✓' : 'Découvrir l\'offre Entreprise'}</span>
+                  </button>
+                </div>
+
+                {/* Pied de page : CGV, FAQ, Crédits */}
+                <div className="pt-2 pb-6 text-center space-y-2">
+                  <div className="flex items-center justify-center space-x-4 text-xs font-medium text-gray-400">
+                    <button onClick={() => setModalInfo('cgv')} className="hover:text-white transition-colors">CGV</button>
+                    <span>•</span>
+                    <button onClick={() => setModalInfo('faq')} className="hover:text-white transition-colors">FAQ</button>
+                    <span>•</span>
+                    <a 
+                      href="https://undercoverapp.axellefebvre-pro57000.workers.dev/#credits" 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="hover:text-blue-400 transition-colors flex items-center space-x-1"
+                    >
+                      <span>Crédits</span>
+                      <LucideIcon name="external-link" size={11} />
+                    </a>
+                  </div>
+                  <p className="text-[10px] text-gray-500 font-mono">
+                    Undercover v0.1 • Ed25519 / X25519 / AES-256-GCM / DPAPI
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* CHAT INTERACTIF PLEIN ÉCRAN */}
+          {activeConversation && (
+            <div className={`absolute inset-0 z-40 flex flex-col ${themeClasses.appWrapper}`}>
+              
+              {/* En-tête Chat */}
+              <div className={`p-4 flex items-center justify-between border-b ${themeClasses.header}`}>
+                <div className="flex items-center space-x-3">
+                  <button 
+                    onClick={() => setActiveConversation(null)}
+                    className="p-1.5 rounded-lg hover:bg-white/10 transition-colors"
+                  >
+                    <LucideIcon name="arrow-left" size={18} />
+                  </button>
+                  <div>
+                    <div className="flex items-center space-x-2">
+                      <span className="font-bold text-sm font-sans">{activeConversation.name}</span>
+                      <span className={`text-[10px] font-mono px-1.5 rounded ${themeClasses.accentBadge}`}>
+                        {activeConversation.key}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-emerald-400 flex items-center space-x-1 font-mono">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                      <span>Canal Chiffré AES-256-GCM</span>
+                    </p>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={() => copyToClipboard(activeConversation.fullKey, "Clé de " + activeConversation.name)}
+                  className="p-2 rounded-xl border border-white/10 hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+                  title="Copier la clé publique"
+                >
+                  <LucideIcon name="key" size={16} />
+                </button>
+              </div>
+
+              {/* Messages */}
+              <div className="flex-1 p-4 overflow-y-auto custom-scrollbar space-y-3 flex flex-col">
+                <div className="text-center py-2">
+                  <span className={`text-[10px] font-mono px-3 py-1 rounded-full border ${isDark ? 'bg-gray-900/80 border-gray-800 text-gray-400' : 'bg-rose-100 border-rose-200 text-rose-700'}`}>
+                    Handshake X25519 établi • Aucun serveur tiers
+                  </span>
+                </div>
+
+                {getContactMessages(activeConversation).map((msg) => {
+                  const isMe = msg.sender === 'me';
+                  return (
+                    <div key={msg.id} className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
+                      <div className={`max-w-[80%] p-3 rounded-2xl text-xs sm:text-sm space-y-1 shadow-md ${isMe ? 'bg-blue-600 text-white rounded-br-none' : (isDark ? 'bg-gray-800 text-gray-100 border border-gray-700 rounded-bl-none' : 'bg-white text-rose-950 border border-rose-200 rounded-bl-none')}`}>
+                        <p className="break-words font-sans">{msg.text}</p>
+                        <div className={`flex items-center justify-end space-x-1 text-[9px] ${isMe ? 'text-blue-200' : 'text-gray-400'}`}>
+                          <span>{msg.time}</span>
+                          <LucideIcon name="lock" size={9} />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Barre de saisie de message */}
+              <div className={`p-3 border-t flex items-center space-x-2 ${themeClasses.header}`}>
+                <input 
+                  type="text"
+                  value={currentInputMsg}
+                  onChange={(e) => setCurrentInputMsg(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleSendMessage(activeConversation.id); }}
+                  placeholder="Message chiffré en AES-256..."
+                  className={`flex-1 px-3.5 py-2.5 rounded-xl text-xs border outline-none ${themeClasses.input}`}
+                />
+                <button 
+                  onClick={() => handleSendMessage(activeConversation.id)}
+                  className={`p-2.5 rounded-xl text-white transition-all shadow-md ${themeClasses.accentButton}`}
+                >
+                  <LucideIcon name="send" size={16} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* BOTTOM TAB BAR FIXE CONDITIONNELLE */}
+          <div className={`shrink-0 flex items-center justify-around py-2.5 px-2 transition-all ${themeClasses.tabBar}`}>
+            
+            {/* Si 0 contact : AFFICHE UNIQUEMENT Connexions et Paramètres */}
+            {hasContacts && (
+              <button 
+                onClick={() => setActiveTab('conversations')}
+                className={`flex flex-col items-center space-y-1 py-1 px-3 rounded-xl transition-all ${activeTab === 'conversations' ? themeClasses.tabActive : 'hover:text-gray-200 opacity-70 hover:opacity-100'}`}
+              >
+                <LucideIcon name="message-square" size={20} />
+                <span className="text-[10px] font-medium font-sans">Discussions</span>
+              </button>
+            )}
+
+            {hasContacts && (
+              <button 
+                onClick={() => setActiveTab('groups')}
+                className={`flex flex-col items-center space-y-1 py-1 px-3 rounded-xl transition-all ${activeTab === 'groups' ? themeClasses.tabActive : 'hover:text-gray-200 opacity-70 hover:opacity-100'}`}
+              >
+                <LucideIcon name="users" size={20} />
+                <span className="text-[10px] font-medium font-sans">Groupes</span>
+              </button>
+            )}
+
+            {/* Toujours visibles : Connexions & Paramètres */}
+            <button 
+              onClick={() => setActiveTab('connections')}
+              className={`flex flex-col items-center space-y-1 py-1 px-3 rounded-xl transition-all ${activeTab === 'connections' ? themeClasses.tabActive : 'hover:text-gray-200 opacity-70 hover:opacity-100'}`}
+            >
+              <LucideIcon name="key-round" size={20} />
+              <span className="text-[10px] font-medium font-sans">Connexions</span>
+            </button>
+
+            <button 
+              onClick={() => setActiveTab('settings')}
+              className={`flex flex-col items-center space-y-1 py-1 px-3 rounded-xl transition-all ${activeTab === 'settings' ? themeClasses.tabActive : 'hover:text-gray-200 opacity-70 hover:opacity-100'}`}
+            >
+              <LucideIcon name="settings" size={20} />
+              <span className="text-[10px] font-medium font-sans">Paramètres</span>
+            </button>
+          </div>
+
+          {/* MODALE CRÉATION DE GROUPE */}
+          {showNewGroupModal && (
+            <div className="absolute inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+              <div className={`w-full max-w-xs p-5 rounded-3xl space-y-4 border ${themeClasses.card}`}>
+                <div className="flex items-center justify-between">
+                  <h3 className={`text-lg font-bold ${themeClasses.titleText}`}>Nouveau Groupe</h3>
+                  <button onClick={() => setShowNewGroupModal(false)} className="text-gray-400 hover:text-white">✕</button>
+                </div>
+                <form onSubmit={handleCreateGroup} className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="text-xs text-gray-400">Nom du groupe</label>
+                    <input 
+                      type="text" 
+                      value={newGroupName} 
+                      onChange={(e) => setNewGroupName(e.target.value)} 
+                      placeholder="Ex: Opération Nébuleuse" 
+                      className={`w-full px-3 py-2 rounded-xl text-xs border outline-none ${themeClasses.input}`} 
+                      autoFocus
+                    />
+                  </div>
+                  <div className="pt-2 flex items-center space-x-2">
+                    <button type="button" onClick={() => setShowNewGroupModal(false)} className="flex-1 py-2 rounded-xl text-xs border border-gray-700 text-gray-300">Annuler</button>
+                    <button type="submit" className={`flex-1 py-2 rounded-xl text-xs font-semibold ${themeClasses.accentButton}`}>Créer</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* MODALE SIMULATEUR SCANNER QR CODE */}
+          {showQrScanner && (
+            <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+              <div className={`w-full max-w-xs p-5 rounded-3xl space-y-4 border text-center ${themeClasses.card}`}>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Scan QR Code</span>
+                  <button onClick={() => setShowQrScanner(false)} className="text-gray-400 hover:text-white">✕</button>
+                </div>
+
+                {/* Viseur de caméra simulé avec ligne animée */}
+                <div className="relative w-48 h-48 mx-auto rounded-2xl border-2 border-dashed border-blue-400/80 bg-black/50 overflow-hidden flex items-center justify-center">
+                  <div className="absolute inset-x-0 h-0.5 bg-blue-400 shadow-[0_0_8px_#38bdf8] animate-scanline"></div>
+                  <LucideIcon name="qr-code" size={72} className="text-gray-700 opacity-40" />
+                </div>
+
+                <p className="text-xs text-gray-400">
+                  Alignez le QR code d'un pair pour extraire instantanément sa clé Ed25519.
+                </p>
+
+                <div className="pt-2 space-y-2">
+                  <button 
+                    onClick={handleSimulateScan}
+                    className={`w-full py-2.5 rounded-xl text-xs font-semibold ${themeClasses.accentButton}`}
+                  >
+                    Simuler la détection QR
+                  </button>
+                  <button 
+                    onClick={() => setShowQrScanner(false)}
+                    className="w-full py-2 rounded-xl text-xs border border-gray-700 text-gray-400 hover:text-white"
+                  >
+                    Fermer
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* MODALE ABONNEMENT ENTREPRISE */}
+          {showEnterpriseModal && (
+            <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+              <div className={`w-full max-w-sm p-6 rounded-3xl space-y-4 border ${themeClasses.card}`}>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-bold font-chalk text-blue-400 flex items-center space-x-2">
+                    <LucideIcon name="crown" size={18} className="text-amber-400" />
+                    <span>Offre Entreprise</span>
+                  </h3>
+                  <button onClick={() => setShowEnterpriseModal(false)} className="text-gray-400 hover:text-white">✕</button>
+                </div>
+
+                <p className="text-xs text-gray-300">
+                  Idéal pour les équipes et organisations nécessitant des ponts chiffrés vers Trello, Excel, ainsi qu'un archivage conforme sans compromettre le chiffrement de bout en bout.
+                </p>
+
+                <div className="p-3 rounded-xl bg-black/30 border border-white/5 space-y-2 text-xs">
+                  <div className="flex justify-between font-mono">
+                    <span className="text-gray-400">Tarif mensuel :</span>
+                    <span className="text-emerald-400 font-bold">2,99 € TTC</span>
+                  </div>
+                  <div className="flex justify-between font-mono">
+                    <span className="text-gray-400">Engagement :</span>
+                    <span>Sans engagement</span>
+                  </div>
+                </div>
+
+                <div className="pt-2 flex items-center space-x-2">
+                  <button 
+                    onClick={() => setShowEnterpriseModal(false)}
+                    className="flex-1 py-2.5 rounded-xl text-xs border border-gray-700 text-gray-300"
+                  >
+                    Fermer
+                  </button>
+                  <button 
+                    onClick={() => {
+                      setEnterpriseActive(!enterpriseActive);
+                      setShowEnterpriseModal(false);
+                      showToastAlert(enterpriseActive ? "Abonnement résilié." : "Perks Entreprise activés avec succès !");
+                    }}
+                    className={`flex-1 py-2.5 rounded-xl text-xs font-semibold ${themeClasses.accentButton}`}
+                  >
+                    {enterpriseActive ? 'Désactiver' : 'Activer (2,99€)'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* MODALE CGV & FAQ */}
+          {modalInfo && (
+            <div className="absolute inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+              <div className={`w-full max-w-sm max-h-[80vh] flex flex-col p-5 rounded-3xl space-y-3 border ${themeClasses.card}`}>
+                <div className="flex items-center justify-between pb-2 border-b border-white/10">
+                  <h3 className={`text-base font-bold ${themeClasses.titleText}`}>
+                    {modalInfo === 'cgv' ? 'Conditions Générales (CGV)' : 'Foire Aux Questions (FAQ)'}
+                  </h3>
+                  <button onClick={() => setModalInfo(null)} className="text-gray-400 hover:text-white">✕</button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto custom-scrollbar text-xs space-y-2.5 text-gray-300 pr-1">
+                  {modalInfo === 'cgv' ? (
+                    <>
+                      <p><strong>1. Objet :</strong> Undercover fournit une infrastructure de messagerie éphémère chiffrée de bout en bout (E2EE) basée sur l'échange de clés publiques Ed25519 et X25519.</p>
+                      <p><strong>2. Données personnelles :</strong> Aucun numéro de téléphone, adresse e-mail ou identité nominative n'est collecté. Les clés privées sont conservées localement dans le coffre Windows DPAPI.</p>
+                      <p><strong>3. Responsabilité :</strong> L'utilisateur est seul responsable de la conservation de sa clé secrète.</p>
+                    </>
+                  ) : (
+                    <>
+                      <p><strong>Q : Comment mes messages sont-ils protégés ?</strong></p>
+                      <p className="text-gray-400">R : Chaque message est chiffré via AES-256-GCM avec un secret partagé dérivé en Diffie-Hellman (X25519) et signé en Ed25519.</p>
+                      <p><strong>Q : Où est stockée ma clé privée sous Windows ?</strong></p>
+                      <p className="text-gray-400">R : Dans le Windows Credential Manager natif, bénéficiant du chiffrement matériel DPAPI de votre session Windows.</p>
+                    </>
+                  )}
+                </div>
+
+                <div className="pt-2">
+                  <button 
+                    onClick={() => setModalInfo(null)}
+                    className="w-full py-2 rounded-xl text-xs border border-gray-700 text-gray-300"
+                  >
+                    Fermer
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

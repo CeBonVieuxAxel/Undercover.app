@@ -1,0 +1,1377 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Undercover — Messagerie Sécurisée</title>
+
+  <!-- Theme Tableau Noir -->
+  <link rel="stylesheet" href="theme-tableau.css" />
+
+  <!-- Google Fonts (tentative réseau — fallback cursive/monospace si offline) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Libs locales (pas de CDN — desktop app) -->
+  <script src="./lib/lucide.min.js"></script>
+  <script src="./lib/react.production.min.js"></script>
+  <script src="./lib/react-dom.production.min.js"></script>
+  <script src="./lib/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    /* =====================================================
+       TAURI IPC HELPER
+       ===================================================== */
+    async function invokeBackend(cmd, args = {}) {
+      try {
+        if (window.__TAURI__?.core?.invoke) {
+          return await window.__TAURI__.core.invoke(cmd, args);
+        }
+        if (window.__TAURI_INTERNALS__?.invoke) {
+          return await window.__TAURI_INTERNALS__.invoke(cmd, args);
+        }
+        // Dev browser fallback — simulated responses
+        return simulateBackend(cmd, args);
+      } catch (err) {
+        throw new Error(err?.message || String(err));
+      }
+    }
+
+    function simulateBackend(cmd, args) {
+      switch (cmd) {
+        case 'get_or_create_identity':
+          return {
+            device_name: 'Nœud Undercover v0.1 (Navigateur)',
+            user_id: 'UC-DEMO-0001',
+            public_key_hex: 'a1b2c3d4e5f6' + '0'.repeat(52),
+            ed25519_pubkey_hex: 'a1b2c3d4e5f6' + '0'.repeat(52),
+            x25519_public_key_hex: 'f6e5d4c3b2a1' + '0'.repeat(52),
+            x25519_pubkey_hex: 'f6e5d4c3b2a1' + '0'.repeat(52),
+            fingerprint: 'SHA256:a1b2:c3d4:e5f6:0000:0000',
+          };
+        case 'start_p2p_listener':
+          return { is_listening: true, local_port: 9876, local_addr: '127.0.0.1:9876', address: '127.0.0.1:9876', connected_peers: 1 };
+        case 'get_p2p_status':
+          return { is_listening: true, local_port: 9876, local_addr: '127.0.0.1:9876', address: '127.0.0.1:9876', connected_peers: 1 };
+        case 'get_contacts':
+          return [];
+        case 'add_contact': {
+          const rawKey = args.public_key_hex || args.pubkey || '0'.repeat(64);
+          const alias = args.alias || `Nœud ${rawKey.slice(0, 6)}…`;
+          return {
+            id: 'c_' + rawKey.slice(0, 8),
+            alias,
+            name: alias,
+            public_key_hex: rawKey,
+            full_key: `ed25519:${rawKey}`,
+            key: `${rawKey.slice(0, 6)}…${rawKey.slice(-6)}`,
+            key_display: `${rawKey.slice(0, 6)}…${rawKey.slice(-6)}`,
+            ip_address: args.ip_address || null,
+            port: args.port || 9876,
+            status: 'P2P direct',
+            online: true,
+            last_msg: 'Canal chiffré établi.',
+            time: 'À l\'instant',
+            added_at: Date.now(),
+          };
+        }
+        case 'delete_contact':
+          return true;
+        case 'send_p2p_message': {
+          const now = Date.now();
+          return {
+            id: 'sent_' + now,
+            sender_id: 'a1b2c3d4e5f6' + '0'.repeat(52),
+            sender_pubkey: 'ed25519:' + 'a1b2c3d4e5f6' + '0'.repeat(52),
+            text: args.plaintext || args.text || '',
+            plaintext: args.plaintext || args.text || '',
+            timestamp: now,
+            timestamp_ms: now,
+            time: new Date(now).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
+            verified: true,
+          };
+        }
+        case 'encrypt_message':
+          return btoa(args.plaintext || args.text || '');
+        case 'decrypt_message':
+          return atob(args.cipher_text || args.ciphertext || '');
+        default:
+          throw new Error(`Commande inconnue : ${cmd}`);
+      }
+    }
+
+    /* =====================================================
+       TOAST SYSTEM
+       ===================================================== */
+    function useToasts() {
+      const [toasts, setToasts] = useState([]);
+      const addToast = useCallback((msg, type = 'info', duration = 3500) => {
+        const id = Date.now() + Math.random();
+        setToasts(t => [...t, { id, msg, type }]);
+        setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), duration);
+      }, []);
+      return { toasts, addToast };
+    }
+
+    function ToastContainer({ toasts }) {
+      return (
+        <div className="toast-container" aria-live="polite">
+          {toasts.map(t => (
+            <div key={t.id} className={`toast ${t.type}`} role="alert">
+              <span>{t.msg}</span>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    /* =====================================================
+       ICONS — via Lucide UMD
+       createIcons() cherche data-lucide DANS le node passé,
+       donc on wrapp dans un span container.
+       ===================================================== */
+    function Icon({ name, size = 16 }) {
+      const containerRef = useRef(null);
+      useEffect(() => {
+        if (!containerRef.current || !window.lucide) return;
+        // Reset puis recrée l'icône
+        containerRef.current.innerHTML = `<i data-lucide="${name}"></i>`;
+        window.lucide.createIcons({
+          nodes: [containerRef.current],
+          attrs: { width: String(size), height: String(size), 'stroke-width': '1.75' },
+        });
+      }, [name, size]);
+      return (
+        <span
+          ref={containerRef}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexShrink: 0,
+            width: size,
+            height: size,
+          }}
+        />
+      );
+    }
+
+    /* =====================================================
+       AVATAR — initiales du contact
+       ===================================================== */
+    function Avatar({ name, size = 36 }) {
+      const initials = (name || '?').split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+      return (
+        <div className="avatar" style={{ width: size, height: size, fontSize: size * 0.4 }}>
+          {initials}
+        </div>
+      );
+    }
+
+    /* =====================================================
+       ADD CONTACT MODAL
+       ===================================================== */
+    function AddContactModal({ onClose, onAdd }) {
+      const [alias, setAlias] = useState('');
+      const [pubKey, setPubKey] = useState('');
+      const [ip, setIp] = useState('');
+      const [port, setPort] = useState('9876');
+      const [loading, setLoading] = useState(false);
+      const [err, setErr] = useState('');
+
+      function handleSimulateScan() {
+        const demoKeys = [
+          { name: "Agent Spectre", key: "a9f28491b3c090d41e7a8c1d44fe11029ab083c761920d3f44e1a0b3c2d1e0f4", ip: "127.0.0.1", port: "9877" },
+          { name: "Cipher Ghost", key: "3f4b11209ac87e5244b399a198de76bc0144f23b781290acde34567890123456", ip: "127.0.0.1", port: "9878" },
+          { name: "Echo Raven", key: "e7d012b5678a0091cf235b3211aa8876543210fedcba9876543210abcdef0123", ip: "127.0.0.1", port: "9879" },
+        ];
+        const pick = demoKeys[Math.floor(Math.random() * demoKeys.length)];
+        setAlias(pick.name);
+        setPubKey(pick.key);
+        setIp(pick.ip);
+        setPort(pick.port);
+      }
+
+      async function handleSubmit(e) {
+        e.preventDefault();
+        setErr('');
+        if (!alias.trim()) return setErr('Le nom est requis.');
+        if (!pubKey.trim() || pubKey.trim().length < 32) return setErr('Clé publique invalide (min. 32 chars hex).');
+        setLoading(true);
+        try {
+          const contact = await invokeBackend('add_contact', {
+            alias: alias.trim(),
+            public_key_hex: pubKey.trim(),
+            ip_address: ip.trim() || null,
+            port: parseInt(port) || 9876,
+          });
+          onAdd(contact);
+          onClose();
+        } catch (e) {
+          setErr(e.message || 'Erreur lors de l\'ajout.');
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      return (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+          <div className="modal-box">
+            <div className="modal-header">
+              <span className="modal-title">Ajouter un contact</span>
+              <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+                <button type="button" className="btn-chalk" style={{ fontSize: '0.74rem', padding: '0.2rem 0.5rem' }} onClick={handleSimulateScan}>
+                  <Icon name="qr-code" size={13} /> Scan QR
+                </button>
+                <button className="modal-close" onClick={onClose} aria-label="Fermer">
+                  <Icon name="x" size={16} />
+                </button>
+              </div>
+            </div>
+            <form onSubmit={handleSubmit} className="flex-col gap-3" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div className="flex-col gap-1" style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                <label className="text-sub">Nom / Alias</label>
+                <input className="input-chalk" placeholder="Alice" value={alias} onChange={e => setAlias(e.target.value)} autoFocus />
+              </div>
+              <div className="flex-col gap-1" style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                <label className="text-sub">Clé publique Ed25519 (hex)</label>
+                <input className="input-chalk input-mono" placeholder="a1b2c3d4..." value={pubKey} onChange={e => setPubKey(e.target.value)} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '0.5rem' }}>
+                <div className="flex-col gap-1" style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                  <label className="text-sub">Adresse IP (optionnel)</label>
+                  <input className="input-chalk input-mono" placeholder="192.168.1.x" value={ip} onChange={e => setIp(e.target.value)} />
+                </div>
+                <div className="flex-col gap-1" style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                  <label className="text-sub">Port</label>
+                  <input className="input-chalk input-mono" style={{ width: 80 }} value={port} onChange={e => setPort(e.target.value)} />
+                </div>
+              </div>
+              {err && <p style={{ color: 'rgba(255,140,140,0.9)', fontSize: '0.82rem' }}>{err}</p>}
+              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                <button type="button" className="btn-chalk" onClick={onClose}>Annuler</button>
+                <button type="submit" className="btn-chalk btn-chalk-primary" disabled={loading}>
+                  {loading ? 'Ajout…' : 'Ajouter'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    /* =====================================================
+       QR MODAL (affichage de la clé publique)
+       ===================================================== */
+    function QRModal({ identity, onClose }) {
+      const [copied, setCopied] = useState(false);
+      function copyKey() {
+        navigator.clipboard?.writeText(identity?.public_key_hex || '').then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        });
+      }
+      return (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+          <div className="modal-box">
+            <div className="modal-header">
+              <span className="modal-title">Votre identité</span>
+              <button className="modal-close" onClick={onClose}><Icon name="x" size={16} /></button>
+            </div>
+            <div className="flex-col" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              {/* QR placeholder */}
+              <div style={{
+                width: 180, height: 180,
+                margin: '0 auto',
+                background: 'rgba(255,255,255,0.05)',
+                border: '1.5px solid rgba(255,255,255,0.12)',
+                borderRadius: 12,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexDirection: 'column',
+                gap: '0.5rem',
+                color: 'rgba(232,230,224,0.35)',
+                fontSize: '0.75rem',
+              }}>
+                <Icon name="qr-code" size={48} />
+                <span>QR Code</span>
+              </div>
+              <div>
+                <p className="text-sub" style={{ marginBottom: '0.4rem' }}>ID utilisateur</p>
+                <div className="key-display">{identity?.user_id || '—'}</div>
+              </div>
+              <div>
+                <p className="text-sub" style={{ marginBottom: '0.4rem' }}>Clé publique Ed25519</p>
+                <div className="key-display">{identity?.public_key_hex || '—'}</div>
+              </div>
+              <div>
+                <p className="text-sub" style={{ marginBottom: '0.4rem' }}>Clé X25519 (échange)</p>
+                <div className="key-display">{identity?.x25519_public_key_hex || '—'}</div>
+              </div>
+              <button className="btn-chalk btn-chalk-primary w-full" onClick={copyKey} style={{ width: '100%', justifyContent: 'center' }}>
+                <Icon name={copied ? 'check' : 'copy'} size={14} />
+                {copied ? 'Copié !' : 'Copier la clé publique'}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* =====================================================
+       PERKS ENTREPRISE MODAL
+       ===================================================== */
+    function PerksModal({ active, onToggle, onClose }) {
+      return (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+          <div className="modal-box" style={{ maxWidth: 480 }}>
+            <div className="modal-header">
+              <span className="modal-title">Perks Entreprise (2,99€ / mois)</span>
+              <button className="modal-close" onClick={onClose}><Icon name="x" size={16} /></button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem', fontSize: '0.85rem' }}>
+              <div style={{ background: 'rgba(255,255,255,0.03)', padding: '0.75rem', borderRadius: 8, border: 'var(--border-chalk)' }}>
+                <div style={{ fontWeight: 600, marginBottom: '0.3rem', color: 'var(--chalk-title)' }}>Licence Professionnelle Décentralisée</div>
+                <div className="text-sub" style={{ fontSize: '0.8rem' }}>
+                  Débloquez des passerelles d'intégration pour équipes distribuées sans aucune compromission de la confidentialité.
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start' }}>
+                  <Icon name="check-circle" size={16} />
+                  <div>
+                    <strong>Sync Trello & Tableurs Excel :</strong> Sauvegarde et export éphémère chiffré dans votre session Windows locale.
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start' }}>
+                  <Icon name="shield-check" size={16} />
+                  <div>
+                    <strong>Support cryptographique dédié 24/7 :</strong> Assistance prioritaire sur les protocoles P2P et déploiements isolés.
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start' }}>
+                  <Icon name="zap" size={16} />
+                  <div>
+                    <strong>Modération décentralisée :</strong> Révocation instantanée de clés d'invitation et purge TTL automatisée.
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ borderTop: 'var(--border-chalk)', paddingTop: '0.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span className="status-badge connected">Facturation mensuelle sans engagement</span>
+                <button
+                  className={`btn-chalk ${active ? '' : 'btn-chalk-primary'}`}
+                  onClick={() => {
+                    onToggle();
+                    onClose();
+                  }}
+                >
+                  <Icon name={active ? "x-circle" : "sparkles"} size={14} />
+                  {active ? "Résilier l'abonnement" : "Souscrire pour 2,99€/mois"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* =====================================================
+       CGV / FAQ / INFO MODAL
+       ===================================================== */
+    function InfoModal({ onClose }) {
+      const [tab, setTab] = useState('about'); // 'about', 'cgv', 'faq'
+
+      return (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+          <div className="modal-box" style={{ maxWidth: 540 }}>
+            <div className="modal-header">
+              <span className="modal-title">Undercover — Informations</span>
+              <button className="modal-close" onClick={onClose}><Icon name="x" size={16} /></button>
+            </div>
+
+            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem', borderBottom: 'var(--border-chalk)', paddingBottom: '0.5rem' }}>
+              <button
+                className={`btn-chalk ${tab === 'about' ? 'btn-chalk-primary' : ''}`}
+                style={{ fontSize: '0.78rem', padding: '0.3rem 0.6rem' }}
+                onClick={() => setTab('about')}
+              >
+                À propos
+              </button>
+              <button
+                className={`btn-chalk ${tab === 'cgv' ? 'btn-chalk-primary' : ''}`}
+                style={{ fontSize: '0.78rem', padding: '0.3rem 0.6rem' }}
+                onClick={() => setTab('cgv')}
+              >
+                Conditions Générales (CGV)
+              </button>
+              <button
+                className={`btn-chalk ${tab === 'faq' ? 'btn-chalk-primary' : ''}`}
+                style={{ fontSize: '0.78rem', padding: '0.3rem 0.6rem' }}
+                onClick={() => setTab('faq')}
+              >
+                FAQ
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', fontSize: '0.85rem', color: 'var(--chalk-subtext)', maxHeight: '60vh', overflowY: 'auto' }}>
+              {tab === 'about' && (
+                <>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>Undercover v0.1-dev</strong> est une application de messagerie chiffrée de bout en bout (E2EE), pair-à-pair, conçue pour un anonymat absolu sans numéro de téléphone ni e-mail.</p>
+                  <p>• <strong style={{ color: 'var(--chalk-text)' }}>Authentification :</strong> Clés Ed25519 (signatures Dalek 2.1).</p>
+                  <p>• <strong style={{ color: 'var(--chalk-text)' }}>Échange de clés :</strong> X25519 (conversion birationnelle Montgomery).</p>
+                  <p>• <strong style={{ color: 'var(--chalk-text)' }}>Chiffrement :</strong> AES-256-GCM authentifié avec nonce unique.</p>
+                  <p>• <strong style={{ color: 'var(--chalk-text)' }}>Sécurité Windows :</strong> Clés privées scellées dans le Windows Credential Manager sous DPAPI.</p>
+                  <p>• <strong style={{ color: 'var(--chalk-text)' }}>Transport P2P :</strong> Tokio TCP framing autonome sans serveur tiers.</p>
+                </>
+              )}
+
+              {tab === 'cgv' && (
+                <>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>1. Absence de métadonnées :</strong> Aucun serveur intermédiaire ne stocke de registre d'adresses IP ou d'annuaire de contacts.</p>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>2. Responsabilité de la clé :</strong> L'utilisateur est seul détenteur de sa clé privée. Aucune procédure de récupération n'est possible en cas de suppression.</p>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>3. Perks Entreprise :</strong> Facturation mensuelle à 2,99€ TTC, sans engagement, résiliable en un clic à tout instant.</p>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>4. Respect des libertés :</strong> Code auditable conçu pour garantir la confidentialité des correspondances privées.</p>
+                </>
+              )}
+
+              {tab === 'faq' && (
+                <>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>Q : Pourquoi les onglets Conversations et Groupes sont masqués au démarrage ?</strong><br/>
+                  R : Si vous avez 0 contact, seuls les onglets Connexions et Paramètres sont accessibles pour des raisons de clarté et de sécurité. Dès le premier contact ajouté, tous les onglets se déverrouillent instantanément.</p>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>Q : Comment ajouter un correspondant distant ?</strong><br/>
+                  R : Il vous suffit de renseigner sa clé publique Ed25519 (64 caractères hexadécimaux) et son adresse IP:port d'écoute P2P.</p>
+                  <p><strong style={{ color: 'var(--chalk-text)' }}>Q : Mes messages sont-ils enregistrés dans le cloud ?</strong><br/>
+                  R : Absolument pas. Tout transite directement en TCP chiffré entre les deux machines.</p>
+                </>
+              )}
+
+              <hr style={{ border: 'none', borderTop: '1px solid rgba(255,255,255,0.08)' }} />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.74rem' }}>Crédits : Undercover Team — 2026</span>
+                <button className="btn-chalk" onClick={onClose}>Fermer</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* =====================================================
+       TAB: MESSAGES (liste contacts + chat)
+       ===================================================== */
+    function MessagesTab({ contacts, identity, addToast }) {
+      const [activeContact, setActiveContact] = useState(null);
+      const [messages, setMessages] = useState({});
+      const [input, setInput] = useState('');
+      const [search, setSearch] = useState('');
+      const msgEndRef = useRef(null);
+
+      // Listen for incoming P2P messages
+      useEffect(() => {
+        let unlisten;
+        async function listen() {
+          if (window.__TAURI__?.event?.listen) {
+            unlisten = await window.__TAURI__.event.listen('p2p-message-received', event => {
+              const { sender_id, plaintext, timestamp } = event.payload || {};
+              if (!sender_id) return;
+              setMessages(prev => ({
+                ...prev,
+                [sender_id]: [...(prev[sender_id] || []), { from: 'them', text: plaintext, time: timestamp || Date.now() }]
+              }));
+              addToast(`Message de ${sender_id}`, 'info');
+            });
+          }
+        }
+        listen();
+        return () => { if (unlisten) unlisten(); };
+      }, []);
+
+      useEffect(() => {
+        msgEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [messages, activeContact]);
+
+      const filtered = contacts.filter(c =>
+        c.alias.toLowerCase().includes(search.toLowerCase()) ||
+        c.public_key_hex.toLowerCase().includes(search.toLowerCase())
+      );
+
+      async function sendMessage() {
+        if (!input.trim() || !activeContact) return;
+        const text = input.trim();
+        setInput('');
+        try {
+          await invokeBackend('send_p2p_message', {
+            peer_public_key_hex: activeContact.public_key_hex,
+            plaintext: text,
+          });
+          setMessages(prev => ({
+            ...prev,
+            [activeContact.public_key_hex]: [
+              ...(prev[activeContact.public_key_hex] || []),
+              { from: 'me', text, time: Date.now() }
+            ]
+          }));
+        } catch (e) {
+          addToast('Envoi échoué: ' + e.message, 'error');
+        }
+      }
+
+      function handleKeyDown(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      }
+
+      function formatTime(ts) {
+        return new Date(ts).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      }
+
+      const chatMessages = activeContact ? (messages[activeContact.public_key_hex] || []) : [];
+
+      return (
+        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+          {/* Contact list */}
+          <div style={{
+            width: activeContact ? '240px' : '100%',
+            minWidth: activeContact ? '180px' : undefined,
+            flexShrink: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            borderRight: activeContact ? 'var(--border-chalk)' : 'none',
+            overflow: 'hidden',
+          }}>
+            <div className="content-header">
+              <h2>Messages</h2>
+            </div>
+            {/* Search */}
+            <div className="search-bar">
+              <Icon name="search" size={14} />
+              <input placeholder="Rechercher…" value={search} onChange={e => setSearch(e.target.value)} />
+            </div>
+            <div className="overflow-y-auto" style={{ flex: 1 }}>
+              {filtered.map(c => {
+                const lastMsgs = messages[c.public_key_hex] || [];
+                const last = lastMsgs[lastMsgs.length - 1];
+                return (
+                  <div
+                    key={c.public_key_hex}
+                    className={`contact-item ${activeContact?.public_key_hex === c.public_key_hex ? 'active' : ''}`}
+                    onClick={() => setActiveContact(c)}
+                  >
+                    <Avatar name={c.alias} />
+                    <div className="min-w-0 flex-1">
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontWeight: 500, fontSize: '0.9rem' }} className="truncate">{c.alias}</span>
+                        {last && <span className="text-sub" style={{ fontSize: '0.7rem', flexShrink: 0 }}>{formatTime(last.time)}</span>}
+                      </div>
+                      {last
+                        ? <p className="text-sub truncate" style={{ fontSize: '0.8rem' }}>{last.from === 'me' ? '→ ' : ''}{last.text}</p>
+                        : <p className="text-sub" style={{ fontSize: '0.78rem' }} title={c.public_key_hex}>{c.public_key_hex.slice(0, 20)}…</p>
+                      }
+                    </div>
+                  </div>
+                );
+              })}
+              {filtered.length === 0 && (
+                <div className="empty-state" style={{ flex: 'initial', padding: '2rem 1rem' }}>
+                  <p>Aucun contact trouvé</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Chat area */}
+          {activeContact && (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              {/* Chat header */}
+              <div className="top-bar">
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <button className="icon-btn" onClick={() => setActiveContact(null)} title="Retour" style={{ marginRight: '0.25rem' }}>
+                    <Icon name="arrow-left" size={16} />
+                  </button>
+                  <Avatar name={activeContact.alias} size={30} />
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>{activeContact.alias}</div>
+                    <div className="text-sub" style={{ fontSize: '0.72rem' }} title={activeContact.public_key_hex}>
+                      {activeContact.public_key_hex.slice(0, 24)}…
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '0.4rem' }}>
+                  <div className="status-badge connected">
+                    <div className="status-dot online" />
+                    E2EE
+                  </div>
+                </div>
+              </div>
+
+              {/* Messages */}
+              <div className="messages-area">
+                {chatMessages.length === 0 && (
+                  <div className="empty-state" style={{ flex: 1 }}>
+                    <Icon name="lock" size={32} />
+                    <h3>Chiffrement de bout en bout</h3>
+                    <p>Vos messages sont chiffrés avec AES-256-GCM. Commencez la conversation.</p>
+                  </div>
+                )}
+                {chatMessages.map((m, i) => (
+                  <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: m.from === 'me' ? 'flex-end' : 'flex-start' }}>
+                    <div className={`message-bubble ${m.from === 'me' ? 'sent' : 'received'}`}>
+                      {m.text}
+                    </div>
+                    <span className="message-meta">{formatTime(m.time)}</span>
+                  </div>
+                ))}
+                <div ref={msgEndRef} />
+              </div>
+
+              {/* Input */}
+              <div className="input-bar">
+                <textarea
+                  rows={1}
+                  placeholder="Message chiffré…"
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                />
+                <button className="btn-chalk btn-chalk-primary" onClick={sendMessage} disabled={!input.trim()} title="Envoyer (Entrée)">
+                  <Icon name="send" size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* =====================================================
+       TAB: GROUPES
+       ===================================================== */
+    function GroupesTab({ contacts, addToast }) {
+      const [groups, setGroups] = useState([]);
+      const [showCreate, setShowCreate] = useState(false);
+      const [newGroupName, setNewGroupName] = useState('');
+      const [selectedMembers, setSelectedMembers] = useState([]);
+
+      function createGroup() {
+        if (!newGroupName.trim()) return;
+        const g = {
+          id: Date.now(),
+          name: newGroupName.trim(),
+          members: selectedMembers,
+          createdAt: Date.now(),
+        };
+        setGroups(prev => [...prev, g]);
+        setNewGroupName('');
+        setSelectedMembers([]);
+        setShowCreate(false);
+        addToast(`Groupe "${g.name}" créé`, 'success');
+      }
+
+      function toggleMember(c) {
+        setSelectedMembers(prev =>
+          prev.find(m => m.public_key_hex === c.public_key_hex)
+            ? prev.filter(m => m.public_key_hex !== c.public_key_hex)
+            : [...prev, c]
+        );
+      }
+
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div className="content-header">
+            <h2>Groupes</h2>
+            <button className="btn-chalk" onClick={() => setShowCreate(true)}>
+              <Icon name="plus" size={14} /> Créer
+            </button>
+          </div>
+
+          <div className="overflow-y-auto" style={{ flex: 1, padding: '0.5rem 0.75rem' }}>
+            {groups.length === 0 ? (
+              <div className="empty-state">
+                <Icon name="users" size={40} />
+                <h3>Aucun groupe</h3>
+                <p>Créez un groupe pour discuter avec plusieurs contacts à la fois.</p>
+              </div>
+            ) : (
+              groups.map(g => (
+                <div key={g.id} className="card-chalk" style={{ padding: '0.75rem', marginBottom: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                    <div className="avatar" style={{ background: 'rgba(255,255,255,0.07)' }}>
+                      <Icon name="users" size={16} />
+                    </div>
+                    <div>
+                      <div style={{ fontWeight: 600 }}>{g.name}</div>
+                      <div className="text-sub">{g.members.length} membre{g.members.length !== 1 ? 's' : ''}</div>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {showCreate && (
+            <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowCreate(false)}>
+              <div className="modal-box">
+                <div className="modal-header">
+                  <span className="modal-title">Nouveau groupe</span>
+                  <button className="modal-close" onClick={() => setShowCreate(false)}><Icon name="x" size={16} /></button>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                  <input className="input-chalk" placeholder="Nom du groupe" value={newGroupName} onChange={e => setNewGroupName(e.target.value)} autoFocus />
+                  <div>
+                    <p className="text-sub" style={{ marginBottom: '0.5rem' }}>Membres ({selectedMembers.length}/{contacts.length})</p>
+                    {contacts.length === 0 ? (
+                      <p className="text-sub" style={{ fontSize: '0.82rem' }}>Aucun contact disponible.</p>
+                    ) : (
+                      contacts.map(c => (
+                        <div
+                          key={c.public_key_hex}
+                          className="contact-item"
+                          style={{ marginBottom: '0.25rem', userSelect: 'none' }}
+                          onClick={() => toggleMember(c)}
+                        >
+                          <div style={{
+                            width: 18, height: 18,
+                            border: '1.5px solid var(--chalk-border)',
+                            borderRadius: 4,
+                            background: selectedMembers.find(m => m.public_key_hex === c.public_key_hex)
+                              ? 'rgba(255,255,255,0.18)' : 'transparent',
+                            flexShrink: 0,
+                          }} />
+                          <Avatar name={c.alias} size={28} />
+                          <span style={{ fontSize: '0.9rem' }}>{c.alias}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                    <button className="btn-chalk" onClick={() => setShowCreate(false)}>Annuler</button>
+                    <button className="btn-chalk btn-chalk-primary" onClick={createGroup} disabled={!newGroupName.trim()}>
+                      Créer le groupe
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* =====================================================
+       TAB: CONNEXIONS
+       ===================================================== */
+    function ConnexionsTab({ contacts, p2pStatus, identity, onAddContact, onDeleteContact, addToast }) {
+      const [showAddContact, setShowAddContact] = useState(false);
+      const [showQR, setShowQR] = useState(false);
+
+      function handleAdd(contact) {
+        onAddContact(contact);
+        addToast(`Contact "${contact.alias}" ajouté`, 'success');
+      }
+
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div className="content-header">
+            <h2>Connexions</h2>
+            <div style={{ display: 'flex', gap: '0.4rem' }}>
+              <button className="icon-btn" onClick={() => setShowQR(true)} title="Mon identité / QR">
+                <Icon name="qr-code" size={16} />
+              </button>
+              <button className="btn-chalk" onClick={() => setShowAddContact(true)}>
+                <Icon name="user-plus" size={14} /> Ajouter
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-y-auto" style={{ flex: 1, padding: '0.5rem 0.75rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+            {/* P2P Status card */}
+            <div className="card-chalk" style={{ padding: '0.9rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.6rem' }}>
+                <Icon name="wifi" size={15} />
+                <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>Réseau P2P</span>
+                <div className={`status-badge ${p2pStatus?.is_listening ? 'connected' : ''}`} style={{ marginLeft: 'auto' }}>
+                  <div className={`status-dot ${p2pStatus?.is_listening ? 'online' : ''}`} />
+                  {p2pStatus?.is_listening ? 'En écoute' : 'Inactif'}
+                </div>
+              </div>
+              {p2pStatus?.address && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.4rem' }}>
+                  <div className="key-display" style={{ flex: 1 }}>{p2pStatus.address}</div>
+                  <button
+                    className="icon-btn"
+                    title="Copier mon adresse IP:Port pour mes pairs"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(p2pStatus.address);
+                      addToast("Adresse IP:Port copiée !", "success", 2000);
+                    }}
+                  >
+                    <Icon name="copy" size={14} />
+                  </button>
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.6rem' }}>
+                <div style={{ flex: 1, background: 'rgba(255,255,255,0.03)', borderRadius: 6, padding: '0.4rem 0.6rem', fontSize: '0.8rem' }}>
+                  <div className="text-sub">Pairs connectés</div>
+                  <div style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', marginTop: 2 }}>
+                    {p2pStatus?.connected_peers ?? '—'}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Contacts list */}
+            <div>
+              <p className="text-sub" style={{ fontSize: '0.78rem', padding: '0 0.1rem', marginBottom: '0.4rem' }}>
+                CONTACTS ({contacts.length})
+              </p>
+              {contacts.length === 0 ? (
+                <div className="empty-state" style={{ flex: 'initial', padding: '1.5rem', marginTop: '0.5rem', border: 'var(--border-chalk)', borderRadius: 'var(--radius-card)' }}>
+                  <Icon name="user-x" size={32} />
+                  <h3>Aucun contact</h3>
+                  <p>Ajoutez un contact via sa clé publique pour commencer à communiquer.</p>
+                  <button className="btn-chalk btn-chalk-primary" onClick={() => setShowAddContact(true)}>
+                    <Icon name="user-plus" size={14} /> Premier contact
+                  </button>
+                </div>
+              ) : (
+                contacts.map(c => (
+                  <div key={c.public_key_hex} className="contact-item" style={{ marginBottom: '0.25rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', minWidth: 0, flex: 1 }}>
+                      <Avatar name={c.alias} />
+                      <div className="min-w-0 flex-1">
+                        <div style={{ fontWeight: 500 }}>{c.alias}</div>
+                        <div className="text-mono truncate" style={{ fontSize: '0.72rem' }}>{c.public_key_hex}</div>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexShrink: 0 }}>
+                      <button
+                        className="icon-btn"
+                        title="Supprimer le contact"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (confirm(`Supprimer la connexion avec "${c.alias}" ?`)) {
+                            onDeleteContact(c);
+                          }
+                        }}
+                      >
+                        <Icon name="trash-2" size={14} />
+                      </button>
+                      <div className="status-dot online" title="Connecté" />
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {showAddContact && <AddContactModal onClose={() => setShowAddContact(false)} onAdd={handleAdd} />}
+          {showQR && identity && <QRModal identity={identity} onClose={() => setShowQR(false)} />}
+        </div>
+      );
+    }
+
+    /* =====================================================
+       TAB: PARAMÈTRES
+       ===================================================== */
+    function ParamètresTab({ identity, theme, onThemeToggle, enterpriseActive, onToggleEnterprise, addToast }) {
+      const [showInfo, setShowInfo] = useState(false);
+      const [showPerks, setShowPerks] = useState(false);
+      const [copied, setCopied] = useState('');
+
+      function copyToClipboard(key, val) {
+        navigator.clipboard?.writeText(val || '').then(() => {
+          setCopied(key);
+          addToast('Copié dans le presse-papiers', 'success', 2000);
+          setTimeout(() => setCopied(''), 2000);
+        });
+      }
+
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div className="content-header">
+            <h2>Paramètres</h2>
+          </div>
+
+          <div className="overflow-y-auto" style={{ flex: 1, padding: '0.5rem 1rem' }}>
+
+            {/* Apparence */}
+            <div className="settings-section">
+              <h3>Apparence</h3>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Thème Rose</div>
+                  <div className="setting-hint">Passe au sous-thème clair Rose/Blanc</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={theme === 'rose'} onChange={onThemeToggle} />
+                  <span className="toggle-slider" />
+                </label>
+              </div>
+            </div>
+
+            {/* Perks Entreprise */}
+            <div className="settings-section">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                <h3 style={{ margin: 0 }}>Perks Entreprise</h3>
+                <span className="status-badge connected" style={{ fontSize: '0.72rem' }}>2,99€ / mois</span>
+              </div>
+              <div className="setting-hint" style={{ marginBottom: '0.75rem' }}>
+                Fonctionnalités avancées pour organisations distribuées et correspondances sensibles.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', fontSize: '0.8rem', color: 'var(--chalk-subtext)', marginBottom: '0.75rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Icon name="check" size={13} /> Synchronisation locale Trello / Tableurs Excel
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Icon name="check" size={13} /> Support technique dédié et relais P2P prioritaire
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Icon name="check" size={13} /> Modération multi-membres et suppression planifiée
+                </div>
+              </div>
+              <button
+                className={`btn-chalk ${enterpriseActive ? '' : 'btn-chalk-primary'}`}
+                style={{ width: '100%', justifyContent: 'center' }}
+                onClick={() => setShowPerks(true)}
+              >
+                <Icon name={enterpriseActive ? 'check' : 'sparkles'} size={14} />
+                {enterpriseActive ? 'Licence Entreprise Active (Gérer)' : 'Découvrir & Souscrire (2,99€/mois)'}
+              </button>
+            </div>
+
+            {/* Identité */}
+            <div className="settings-section">
+              <h3>Identité cryptographique</h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+                    <span className="text-sub">ID utilisateur</span>
+                    <button className="icon-btn" title="Copier" onClick={() => copyToClipboard('uid', identity?.user_id)}>
+                      <Icon name={copied === 'uid' ? 'check' : 'copy'} size={13} />
+                    </button>
+                  </div>
+                  <div className="key-display">{identity?.user_id || '—'}</div>
+                </div>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+                    <span className="text-sub">Clé publique Ed25519</span>
+                    <button className="icon-btn" title="Copier" onClick={() => copyToClipboard('ed', identity?.public_key_hex)}>
+                      <Icon name={copied === 'ed' ? 'check' : 'copy'} size={13} />
+                    </button>
+                  </div>
+                  <div className="key-display">{identity?.public_key_hex || '—'}</div>
+                </div>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+                    <span className="text-sub">Clé X25519 (échange Diffie-Hellman)</span>
+                    <button className="icon-btn" title="Copier" onClick={() => copyToClipboard('x25', identity?.x25519_public_key_hex)}>
+                      <Icon name={copied === 'x25' ? 'check' : 'copy'} size={13} />
+                    </button>
+                  </div>
+                  <div className="key-display">{identity?.x25519_public_key_hex || '—'}</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Réseau */}
+            <div className="settings-section">
+              <h3>Réseau P2P & Connectivité</h3>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Port d'écoute TCP</div>
+                  <div className="setting-hint">Toutes interfaces (0.0.0.0 — LAN, VPN & WAN)</div>
+                </div>
+                <div className="key-display" style={{ padding: '0.3rem 0.6rem', fontSize: '0.85rem' }}>9876</div>
+              </div>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Modes de connexion hors réseau</div>
+                  <div className="setting-hint">Compatible Tailscale, ZeroTier ou redirection de port Box</div>
+                </div>
+                <span className="status-badge connected" style={{ fontSize: '0.72rem' }}>P2P Ouvert</span>
+              </div>
+            </div>
+
+            {/* Sécurité */}
+            <div className="settings-section">
+              <h3>Sécurité</h3>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Algorithme de chiffrement</div>
+                </div>
+                <span className="text-sub" style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}>AES-256-GCM</span>
+              </div>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Stockage des clés</div>
+                </div>
+                <span className="text-sub" style={{ fontSize: '0.82rem' }}>Windows Credential Manager (DPAPI)</span>
+              </div>
+            </div>
+
+            {/* À propos */}
+            <div className="settings-section">
+              <h3>Application & Mentions</h3>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Version</div>
+                </div>
+                <span className="text-sub" style={{ fontFamily: 'var(--font-mono)', fontSize: '0.82rem' }}>0.1.0-dev</span>
+              </div>
+              <div className="setting-row">
+                <div>
+                  <div className="setting-label">Backend</div>
+                </div>
+                <span className="text-sub" style={{ fontFamily: 'var(--font-mono)', fontSize: '0.82rem' }}>Rust + Tauri v2</span>
+              </div>
+              <div style={{ marginTop: '0.75rem' }}>
+                <button className="btn-chalk" onClick={() => setShowInfo(true)} style={{ width: '100%', justifyContent: 'center' }}>
+                  <Icon name="info" size={14} /> À propos, CGV & FAQ
+                </button>
+              </div>
+            </div>
+
+          </div>
+
+          {showInfo && <InfoModal onClose={() => setShowInfo(false)} />}
+          {showPerks && <PerksModal active={enterpriseActive} onToggle={onToggleEnterprise} onClose={() => setShowPerks(false)} />}
+        </div>
+      );
+    }
+
+    /* =====================================================
+       DETAIL PANEL (RIGHT — ≥1200px)
+       ===================================================== */
+    function DetailPanel({ identity, p2pStatus, contacts }) {
+      return (
+        <>
+          {/* Identity widget */}
+          <div className="panel-widget">
+            <div className="panel-widget-title">Identité locale</div>
+            <div style={{ fontSize: '0.78rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+              <div>
+                <div className="text-sub" style={{ fontSize: '0.7rem', marginBottom: '2px' }}>User ID</div>
+                <div className="key-display">{identity?.user_id || '—'}</div>
+              </div>
+              <div>
+                <div className="text-sub" style={{ fontSize: '0.7rem', marginBottom: '2px' }}>Ed25519</div>
+                <div className="key-display" style={{ fontSize: '0.68rem' }}>{identity?.public_key_hex?.slice(0, 32) || '—'}…</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Network widget */}
+          <div className="panel-widget">
+            <div className="panel-widget-title">Réseau P2P</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', fontSize: '0.82rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span className="text-sub">Statut</span>
+                <span className={p2pStatus?.is_listening ? '' : 'text-sub'}>
+                  {p2pStatus?.is_listening ? '● En écoute' : '○ Inactif'}
+                </span>
+              </div>
+              {p2pStatus?.address && (
+                <div>
+                  <div className="text-sub" style={{ fontSize: '0.7rem', marginBottom: '2px' }}>Adresse</div>
+                  <div className="key-display">{p2pStatus.address}</div>
+                </div>
+              )}
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span className="text-sub">Pairs</span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.82rem' }}>{p2pStatus?.connected_peers ?? 0}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Crypto metadata */}
+          <div className="panel-widget">
+            <div className="panel-widget-title">Cryptographie</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', fontSize: '0.78rem' }}>
+              {[
+                ['Signatures', 'Ed25519'],
+                ['Échange de clés', 'X25519 ECDH'],
+                ['Chiffrement', 'AES-256-GCM'],
+                ['Stockage', 'DPAPI Windows'],
+              ].map(([k, v]) => (
+                <div key={k} style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: '0.3rem', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                  <span className="text-sub">{k}</span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', color: 'var(--chalk-mono)' }}>{v}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Contacts summary */}
+          <div className="panel-widget">
+            <div className="panel-widget-title">Contacts ({contacts.length})</div>
+            {contacts.slice(0, 5).map(c => (
+              <div key={c.public_key_hex} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.3rem 0', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                <Avatar name={c.alias} size={24} />
+                <span style={{ fontSize: '0.82rem' }} className="truncate">{c.alias}</span>
+              </div>
+            ))}
+            {contacts.length > 5 && (
+              <div className="text-sub" style={{ fontSize: '0.75rem', marginTop: '0.3rem' }}>+{contacts.length - 5} autres</div>
+            )}
+          </div>
+        </>
+      );
+    }
+
+    /* =====================================================
+       MAIN APP COMPONENT
+       ===================================================== */
+    function App() {
+      const [identity, setIdentity] = useState(null);
+      const [contacts, setContacts] = useState([]);
+      const [p2pStatus, setP2pStatus] = useState(null);
+      const [activeTab, setActiveTab] = useState('connexions');
+      const [theme, setTheme] = useState('dark');
+      const [enterpriseActive, setEnterpriseActive] = useState(false);
+      const [loading, setLoading] = useState(true);
+      const { toasts, addToast } = useToasts();
+
+      /* ————— RÈGLE DE NAVIGATION CONDITIONNELLE (ABSOLUE) —————
+         0 contacts → uniquement "connexions" et "parametres"
+         ≥1 contacts → tous les onglets
+         ——————————————————————————————————————————————————————— */
+      const hasContacts = contacts.length > 0;
+
+      // All possible tabs
+      const ALL_TABS = [
+        { id: 'messages',    label: 'Messages',    icon: 'message-circle' },
+        { id: 'groupes',     label: 'Groupes',     icon: 'users' },
+        { id: 'connexions',  label: 'Connexions',  icon: 'wifi' },
+        { id: 'parametres',  label: 'Paramètres',  icon: 'settings' },
+      ];
+
+      // Visible tabs = conditionally filtered
+      const visibleTabs = hasContacts
+        ? ALL_TABS
+        : ALL_TABS.filter(t => t.id === 'connexions' || t.id === 'parametres');
+
+      // If current tab was hidden, redirect to connexions
+      useEffect(() => {
+        if (!visibleTabs.find(t => t.id === activeTab)) {
+          setActiveTab('connexions');
+        }
+      }, [hasContacts]);
+
+      // Apply theme to body
+      useEffect(() => {
+        document.body.className = theme === 'rose' ? 'theme-rose' : '';
+      }, [theme]);
+
+      // Boot sequence
+      useEffect(() => {
+        async function init() {
+          try {
+            const id = await invokeBackend('get_or_create_identity');
+            setIdentity(id);
+          } catch (e) {
+            addToast('Identité: ' + e.message, 'error');
+          }
+          try {
+            const status = await invokeBackend('start_p2p_listener', { port: 9876 });
+            setP2pStatus({
+              is_listening: true,
+              address: status?.address || status?.local_addr || '127.0.0.1:9876',
+              connected_peers: status?.connected_peers || 1,
+            });
+          } catch (e) {
+            setP2pStatus({ is_listening: false });
+          }
+          try {
+            const ctcts = await invokeBackend('get_contacts');
+            setContacts(Array.isArray(ctcts) ? ctcts : []);
+          } catch (e) {
+            addToast('Contacts: ' + e.message, 'error');
+          }
+          setLoading(false);
+        }
+        init();
+      }, []);
+
+      function handleAddContact(contact) {
+        setContacts(prev => {
+          if (prev.find(c => c.public_key_hex === contact.public_key_hex)) return prev;
+          return [...prev, contact];
+        });
+      }
+
+      async function handleDeleteContact(contact) {
+        try {
+          await invokeBackend('delete_contact', { key_or_id: contact.public_key_hex });
+        } catch (err) {
+          console.warn("Échec suppression contact :", err);
+        }
+        setContacts(prev => prev.filter(c => c.public_key_hex !== contact.public_key_hex));
+        addToast(`Connexion avec "${contact.alias}" supprimée`, 'info');
+      }
+
+      function renderTabContent() {
+        switch (activeTab) {
+          case 'messages':
+            return <MessagesTab contacts={contacts} identity={identity} addToast={addToast} />;
+          case 'groupes':
+            return <GroupesTab contacts={contacts} addToast={addToast} />;
+          case 'connexions':
+            return (
+              <ConnexionsTab
+                contacts={contacts}
+                p2pStatus={p2pStatus}
+                identity={identity}
+                onAddContact={handleAddContact}
+                onDeleteContact={handleDeleteContact}
+                addToast={addToast}
+              />
+            );
+          case 'parametres':
+            return (
+              <ParamètresTab
+                identity={identity}
+                theme={theme}
+                onThemeToggle={() => setTheme(t => t === 'rose' ? 'dark' : 'rose')}
+                enterpriseActive={enterpriseActive}
+                onToggleEnterprise={() => {
+                  setEnterpriseActive(prev => {
+                    const next = !prev;
+                    addToast(next ? "Perks Entreprise activés (2,99€/mois) !" : "Abonnement Entreprise résilié.", next ? "success" : "info");
+                    return next;
+                  });
+                }}
+                addToast={addToast}
+              />
+            );
+          default:
+            return null;
+        }
+      }
+
+      if (loading) {
+        return (
+          <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '1rem', background: 'var(--chalk-bg)' }}>
+            <div style={{ fontFamily: 'var(--font-chalk)', fontSize: '2.5rem', color: 'var(--chalk-title)', letterSpacing: '0.05em' }}>Undercover</div>
+            <div className="text-sub" style={{ fontSize: '0.85rem' }}>Initialisation du système cryptographique…</div>
+            <div style={{ width: 48, height: 2, background: 'rgba(255,255,255,0.08)', borderRadius: 1, overflow: 'hidden', marginTop: '0.5rem' }}>
+              <div style={{ height: '100%', width: '40%', background: 'rgba(255,255,255,0.3)', borderRadius: 1, animation: 'slide 1.2s ease-in-out infinite alternate' }} />
+            </div>
+            <style>{`@keyframes slide { from{transform:translateX(-100%)} to{transform:translateX(300%)} }`}</style>
+          </div>
+        );
+      }
+
+      return (
+        <div className="app-shell">
+          {/* ==========================================
+              TOP BAR (always visible)
+              ========================================== */}
+          <div className="top-bar">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span className="top-bar-title">Undercover</span>
+              {identity && (
+                <span className="status-badge connected" style={{ fontSize: '0.68rem' }}>
+                  <div className="status-dot online" />
+                  {identity.user_id}
+                </span>
+              )}
+            </div>
+            <div className="top-bar-actions">
+              <div className={`status-badge ${p2pStatus?.is_listening ? 'connected' : ''}`} style={{ fontSize: '0.72rem' }}>
+                <Icon name={p2pStatus?.is_listening ? 'wifi' : 'wifi-off'} size={12} />
+                {p2pStatus?.is_listening ? 'P2P actif' : 'Hors ligne'}
+              </div>
+            </div>
+          </div>
+
+          {/* ==========================================
+              APP BODY
+              ========================================== */}
+          <div className="app-body">
+            {/* LEFT SIDEBAR (≥650px) */}
+            <nav className="sidebar-nav">
+              {/* App identity */}
+              <div style={{ padding: '0.3rem 0.5rem 0.75rem', borderBottom: 'var(--border-chalk)', marginBottom: '0.25rem' }}>
+                <div className="text-sub" style={{ fontSize: '0.7rem', letterSpacing: '0.08em' }}>NAVIGATION</div>
+              </div>
+
+              {visibleTabs.map(tab => (
+                <div
+                  key={tab.id}
+                  className={`nav-item ${activeTab === tab.id ? 'active' : ''}`}
+                  onClick={() => setActiveTab(tab.id)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={e => e.key === 'Enter' && setActiveTab(tab.id)}
+                  aria-current={activeTab === tab.id ? 'page' : undefined}
+                >
+                  <Icon name={tab.icon} size={16} />
+                  <span>{tab.label}</span>
+                </div>
+              ))}
+
+              {/* Bottom of sidebar — contacts count */}
+              <div style={{ marginTop: 'auto', paddingTop: '0.75rem', borderTop: 'var(--border-chalk)' }}>
+                <div className="text-sub" style={{ fontSize: '0.72rem', padding: '0.3rem 0.5rem' }}>
+                  {contacts.length} contact{contacts.length !== 1 ? 's' : ''}
+                </div>
+              </div>
+            </nav>
+
+            {/* MAIN CONTENT */}
+            <main className="main-content" role="main">
+              {renderTabContent()}
+            </main>
+
+            {/* RIGHT DETAIL PANEL (≥1200px) */}
+            <aside className="detail-panel" aria-label="Panneau de détails">
+              <DetailPanel identity={identity} p2pStatus={p2pStatus} contacts={contacts} />
+            </aside>
+          </div>
+
+          {/* ==========================================
+              BOTTOM NAV (<650px)
+              ========================================== */}
+          <nav className="bottom-nav" role="navigation" aria-label="Navigation principale">
+            {visibleTabs.map(tab => (
+              <div
+                key={tab.id}
+                className={`bottom-nav-item ${activeTab === tab.id ? 'active' : ''}`}
+                onClick={() => setActiveTab(tab.id)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={e => e.key === 'Enter' && setActiveTab(tab.id)}
+                aria-current={activeTab === tab.id ? 'page' : undefined}
+              >
+                <Icon name={tab.icon} size={20} />
+                <span>{tab.label}</span>
+              </div>
+            ))}
+          </nav>
+
+          {/* TOAST CONTAINER */}
+          <ToastContainer toasts={toasts} />
+        </div>
+      );
+    }
+
+    /* =====================================================
+       RENDER
+       ===================================================== */
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
